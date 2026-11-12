@@ -59,7 +59,7 @@ MAX_INTERVAL = 365
 
 # стани діалогу
 (TARGET, TARGET_ID, NAME, FOOD_ST, COUNT, FIRST, LAST,
- COMMENT_Q, COMMENT, EDIT_PICK, EDIT_FIELD, PERIOD, PERIOD_N, START_ST) = range(14)
+ COMMENT_Q, COMMENT, EDIT_PICK, EDIT_FIELD, PERIOD, PERIOD_N, START_ST, START_DATE) = range(15)
 
 
 # ---------- допоміжне ----------
@@ -80,6 +80,23 @@ def parse_time(text: str) -> str | None:
     if h > 23 or mnt > 59:
         return None
     return f"{h:02d}:{mnt:02d}"
+
+
+def parse_date(text: str, today: dt.date) -> dt.date | None:
+    """'20.11', '20.11.2026', '20/11/26' -> дата. Без року — найближча така дата в майбутньому."""
+    m = re.fullmatch(r"\s*(\d{1,2})[./\-\s](\d{1,2})(?:[./\-\s](\d{2}|\d{4}))?\s*", text)
+    if not m:
+        return None
+    day, month = int(m.group(1)), int(m.group(2))
+    year = m.group(3)
+    try:
+        if year:
+            y = int(year)
+            return dt.date(y + 2000 if y < 100 else y, month, day)
+        d = dt.date(today.year, month, day)
+        return d if d >= today else dt.date(today.year + 1, month, day)
+    except ValueError:
+        return None
 
 
 def to_min(t: str) -> int:
@@ -333,7 +350,8 @@ async def ask_start(update, context) -> int:
     today = dt.datetime.now(TZ).date()
     tomorrow = today + dt.timedelta(days=1)
     await say(update, "З якого дня почати?",
-              kb([[(f"Сьогодні ({today:%d.%m})", "st:0"), (f"Завтра ({tomorrow:%d.%m})", "st:1")]]))
+              kb([[(f"Сьогодні ({today:%d.%m})", "st:0"), (f"Завтра ({tomorrow:%d.%m})", "st:1")],
+                  [("📆 Інша дата", "st:custom")]]))
     return START_ST
 
 
@@ -444,8 +462,26 @@ async def period_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 
 async def start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    offset = int(update.callback_query.data.split(":")[1])
-    draft(context)["start_date"] = (dt.datetime.now(TZ).date() + dt.timedelta(days=offset)).isoformat()
+    value = update.callback_query.data.split(":")[1]
+    if value == "custom":
+        await say(update, "Введіть дату першого прийому, напр. <code>20.11</code> або <code>20.11.2026</code>:",
+                  kb([]))
+        return START_DATE
+    draft(context)["start_date"] = (dt.datetime.now(TZ).date() + dt.timedelta(days=int(value))).isoformat()
+    return await after_period(update, context)
+
+
+async def start_date_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    today = dt.datetime.now(TZ).date()
+    d = parse_date(update.message.text, today)
+    if not d:
+        await update.message.reply_text("Не розпізнав дату. Формат: <code>20.11</code> або <code>20.11.2026</code>.")
+        return START_DATE
+    if d < today:
+        await update.message.reply_text("Дата вже минула. Введіть сьогоднішню або майбутню дату:")
+        return START_DATE
+    draft(context)["start_date"] = d.isoformat()
+    await update.message.reply_text(f"Початок: <b>{d:%d.%m.%Y}</b> ✅")
     return await after_period(update, context)
 
 
@@ -705,7 +741,8 @@ def main() -> None:
             FOOD_ST: [CallbackQueryHandler(food_cb, pattern=r"^food:")],
             PERIOD: [CallbackQueryHandler(period_cb, pattern=r"^per:")],
             PERIOD_N: [MessageHandler(TEXT_INPUT, period_text)],
-            START_ST: [CallbackQueryHandler(start_cb, pattern=r"^st:\d$")],
+            START_ST: [CallbackQueryHandler(start_cb, pattern=r"^st:(\d|custom)$")],
+            START_DATE: [MessageHandler(TEXT_INPUT, start_date_text)],
             COUNT: [CallbackQueryHandler(count_input, pattern=r"^cnt:"),
                     MessageHandler(TEXT_INPUT, count_input)],
             FIRST: [CallbackQueryHandler(first_input, pattern=r"^tm:"),
