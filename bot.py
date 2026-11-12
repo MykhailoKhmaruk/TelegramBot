@@ -55,10 +55,11 @@ TEXT_INPUT = filters.TEXT & ~filters.COMMAND & ~MENU_FILTER
 
 FOOD = {"after": "Після їжі", "before": "До їжі", "any": "Не важливо"}
 MAX_PER_DAY = 12
+MAX_INTERVAL = 365
 
 # стани діалогу
 (TARGET, TARGET_ID, NAME, FOOD_ST, COUNT, FIRST, LAST,
- COMMENT_Q, COMMENT, EDIT_PICK, EDIT_FIELD) = range(11)
+ COMMENT_Q, COMMENT, EDIT_PICK, EDIT_FIELD, PERIOD, PERIOD_N, START_ST) = range(14)
 
 
 # ---------- допоміжне ----------
@@ -108,6 +109,45 @@ def distribute(first: str, last: str, n: int) -> list[str]:
     return sorted(set(result), key=to_min)
 
 
+def days_word(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return "день"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return "дні"
+    return "днів"
+
+
+def period_label(interval: int) -> str:
+    if interval <= 1:
+        return "щодня"
+    if interval == 2:
+        return "через день"
+    if interval == 7:
+        return "раз на тиждень"
+    return f"раз на {interval} {days_word(interval)}"
+
+
+def is_due(med: dict, day: dt.date) -> bool:
+    """Чи припадає прийом на цей день з урахуванням періодичності."""
+    interval = med.get("interval_days") or 1
+    if interval <= 1 or not med.get("start_date"):
+        return True
+    delta = (day - dt.date.fromisoformat(med["start_date"])).days
+    return delta >= 0 and delta % interval == 0
+
+
+def next_due_date(med: dict) -> dt.date:
+    now = dt.datetime.now(TZ)
+    day = now.date()
+    if is_due(med, day) and med["times"] and now.strftime("%H:%M") >= max(med["times"], key=to_min):
+        day += dt.timedelta(days=1)  # сьогоднішні прийоми вже минули
+    for _ in range(MAX_INTERVAL + 1):
+        if is_due(med, day):
+            return day
+        day += dt.timedelta(days=1)
+    return day
+
+
 def user_label(user_id: int) -> str:
     u = db.get_user(user_id)
     if not u:
@@ -122,8 +162,11 @@ def med_summary(med: dict, viewer_id: int | None = None) -> str:
     lines = [
         f"💊 <b>{html.escape(med['name'])}</b>",
         f"🍽 {FOOD[med['food']]}",
+        f"📅 {period_label(med.get('interval_days') or 1).capitalize()}",
         f"⏰ {', '.join(med['times'])} ({len(med['times'])} р/день)",
     ]
+    if (med.get("interval_days") or 1) > 1:
+        lines.append(f"➡️ Наступний день прийому: {next_due_date(med).strftime('%d.%m.%Y')}")
     if med.get("comment"):
         lines.append(f"📝 {html.escape(med['comment'])}")
     if viewer_id is not None and med["owner_id"] != med["target_id"]:
@@ -178,6 +221,8 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     med = db.get_med(context.job.data)
     if not med or not med["active"]:
         return
+    if not is_due(med, dt.datetime.now(TZ).date()):
+        return  # сьогодні не день прийому (через день / раз на тиждень тощо)
     text = [f"⏰ <b>Час прийняти ліки!</b>\n\n💊 <b>{html.escape(med['name'])}</b>",
             f"🍽 {FOOD[med['food']]}"]
     if med["comment"]:
@@ -276,6 +321,22 @@ async def ask_food(update, context) -> int:
     return FOOD_ST
 
 
+async def ask_period(update, context) -> int:
+    await say(update, "Як часто приймати?",
+              kb([[("📅 Щодня", "per:1"), ("🔁 Через день", "per:2")],
+                  [("🗓 Раз на тиждень", "per:7")],
+                  [("🔢 Раз на N днів (ввести число)", "per:n")]]))
+    return PERIOD
+
+
+async def ask_start(update, context) -> int:
+    today = dt.datetime.now(TZ).date()
+    tomorrow = today + dt.timedelta(days=1)
+    await say(update, "З якого дня почати?",
+              kb([[(f"Сьогодні ({today:%d.%m})", "st:0"), (f"Завтра ({tomorrow:%d.%m})", "st:1")]]))
+    return START_ST
+
+
 async def ask_count(update, context) -> int:
     await say(update, "Скільки разів на день? (оберіть або введіть число)",
               kb([[(str(i), f"cnt:{i}") for i in range(1, 4)],
@@ -353,6 +414,44 @@ async def food_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     draft(context)["food"] = update.callback_query.data.split(":")[1]
     if editing(context):
         return await finish(update, context)
+    return await ask_period(update, context)
+
+
+async def set_period(update, context, interval: int) -> int:
+    d = draft(context)
+    d["interval_days"] = interval
+    if interval == 1:
+        d["start_date"] = None
+        return await after_period(update, context)
+    return await ask_start(update, context)
+
+
+async def period_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = update.callback_query.data.split(":")[1]
+    if value == "n":
+        await say(update, f"Раз на скільки днів приймати? Введіть число від 2 до {MAX_INTERVAL}\n"
+                          "<i>Напр. 3 — раз на 3 дні (прийом, два дні перерви, прийом…)</i>", kb([]))
+        return PERIOD_N
+    return await set_period(update, context, int(value))
+
+
+async def period_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = update.message.text.strip()
+    if not raw.isdigit() or not 1 <= int(raw) <= MAX_INTERVAL:
+        await update.message.reply_text(f"Введіть число від 1 до {MAX_INTERVAL}.")
+        return PERIOD_N
+    return await set_period(update, context, int(raw))
+
+
+async def start_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    offset = int(update.callback_query.data.split(":")[1])
+    draft(context)["start_date"] = (dt.datetime.now(TZ).date() + dt.timedelta(days=offset)).isoformat()
+    return await after_period(update, context)
+
+
+async def after_period(update, context) -> int:
+    if editing(context):
+        return await finish(update, context)
     return await ask_count(update, context)
 
 
@@ -421,7 +520,8 @@ async def finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     uid = update.effective_user.id
     if editing(context):
         med_id = context.user_data["edit_id"]
-        db.update_med(med_id, d["name"], d["food"], d["times"], d.get("comment"))
+        db.update_med(med_id, d["name"], d["food"], d["times"], d.get("comment"),
+                      d.get("interval_days", 1), d.get("start_date"))
         med = db.get_med(med_id)
         schedule(context.application, med)
         await say(update, "✅ Нагадування оновлено:\n\n" + med_summary(med, uid), MAIN_MENU)
@@ -429,7 +529,8 @@ async def finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             await notify(context, med["target_id"],
                          f"✏️ {user_label(uid)} змінив(ла) ваше призначення:\n\n" + med_summary(med))
     else:
-        med_id = db.add_med(uid, d["target_id"], d["name"], d["food"], d["times"], d.get("comment"))
+        med_id = db.add_med(uid, d["target_id"], d["name"], d["food"], d["times"], d.get("comment"),
+                            d.get("interval_days", 1), d.get("start_date"))
         med = db.get_med(med_id)
         schedule(context.application, med)
         await say(update, "✅ Нагадування створено:\n\n" + med_summary(med, uid), MAIN_MENU)
@@ -488,17 +589,19 @@ async def edit_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         mode="edit",
         edit_id=med["id"],
         draft={"name": med["name"], "food": med["food"], "times": med["times"],
-               "count": len(med["times"]), "comment": med["comment"]},
+               "count": len(med["times"]), "comment": med["comment"],
+               "interval_days": med.get("interval_days") or 1, "start_date": med.get("start_date")},
     )
     await say(update, med_summary(med, uid) + "\n\nЩо змінити?",
               kb([[("Назву", "fld:name"), ("До/після їжі", "fld:food")],
-                  [("Час прийому", "fld:times"), ("Коментар", "fld:comment")]]))
+                  [("Періодичність", "fld:period"), ("Час прийому", "fld:times")],
+                  [("Коментар", "fld:comment")]]))
     return EDIT_FIELD
 
 
 async def edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     field = update.callback_query.data.split(":")[1]
-    return await {"name": ask_name, "food": ask_food,
+    return await {"name": ask_name, "food": ask_food, "period": ask_period,
                   "times": ask_count, "comment": ask_comment_q}[field](update, context)
 
 
@@ -600,6 +703,9 @@ def main() -> None:
             TARGET_ID: [MessageHandler(TEXT_INPUT, target_id_text)],
             NAME: [MessageHandler(TEXT_INPUT, name_text)],
             FOOD_ST: [CallbackQueryHandler(food_cb, pattern=r"^food:")],
+            PERIOD: [CallbackQueryHandler(period_cb, pattern=r"^per:")],
+            PERIOD_N: [MessageHandler(TEXT_INPUT, period_text)],
+            START_ST: [CallbackQueryHandler(start_cb, pattern=r"^st:\d$")],
             COUNT: [CallbackQueryHandler(count_input, pattern=r"^cnt:"),
                     MessageHandler(TEXT_INPUT, count_input)],
             FIRST: [CallbackQueryHandler(first_input, pattern=r"^tm:"),

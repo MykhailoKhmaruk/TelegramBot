@@ -34,10 +34,18 @@ def init() -> None:
                 food      TEXT    NOT NULL,   -- after / before / any
                 times     TEXT    NOT NULL,   -- "08:00,14:00,20:00"
                 comment   TEXT,
-                active    INTEGER NOT NULL DEFAULT 1
+                active    INTEGER NOT NULL DEFAULT 1,
+                interval_days INTEGER NOT NULL DEFAULT 1,  -- 1 = щодня, 2 = через день, 7 = раз на тиждень
+                start_date    TEXT                         -- 'YYYY-MM-DD', від якої дати рахувати інтервал
             );
             """
         )
+        # міграція старих баз
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(meds)")}
+        if "interval_days" not in cols:
+            c.execute("ALTER TABLE meds ADD COLUMN interval_days INTEGER NOT NULL DEFAULT 1")
+        if "start_date" not in cols:
+            c.execute("ALTER TABLE meds ADD COLUMN start_date TEXT")
 
 
 # ---------- користувачі ----------
@@ -80,20 +88,23 @@ def _med(row) -> dict | None:
     return d
 
 
-def add_med(owner_id: int, target_id: int, name: str, food: str, times: list[str], comment: str | None) -> int:
+def add_med(owner_id: int, target_id: int, name: str, food: str, times: list[str], comment: str | None,
+            interval_days: int = 1, start_date: str | None = None) -> int:
     with _conn() as c:
         cur = c.execute(
-            "INSERT INTO meds(owner_id, target_id, name, food, times, comment) VALUES (?, ?, ?, ?, ?, ?)",
-            (owner_id, target_id, name, food, ",".join(times), comment),
+            "INSERT INTO meds(owner_id, target_id, name, food, times, comment, interval_days, start_date) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (owner_id, target_id, name, food, ",".join(times), comment, interval_days, start_date),
         )
         return cur.lastrowid
 
 
-def update_med(med_id: int, name: str, food: str, times: list[str], comment: str | None) -> None:
+def update_med(med_id: int, name: str, food: str, times: list[str], comment: str | None,
+               interval_days: int = 1, start_date: str | None = None) -> None:
     with _conn() as c:
         c.execute(
-            "UPDATE meds SET name=?, food=?, times=?, comment=? WHERE id=?",
-            (name, food, ",".join(times), comment, med_id),
+            "UPDATE meds SET name=?, food=?, times=?, comment=?, interval_days=?, start_date=? WHERE id=?",
+            (name, food, ",".join(times), comment, interval_days, start_date, med_id),
         )
 
 
